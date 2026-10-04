@@ -126,6 +126,7 @@ docs-contract-test:
 integration-assets-test:
     bun test src/integration/assets/herdr-agent-state.test.ts
     bun test src/integration/assets/opencode/herdr-agent-state.test.ts
+    bun test src/integration/assets/kilo/herdr-agent-state.test.ts
     bun test src/integration/assets/opencode/herdr-tui-session.test.ts
 
 # Regenerate the C API bindings with bindgen-cli 0.72.1
