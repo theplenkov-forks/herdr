@@ -102,11 +102,15 @@ function requestOnce(method, params) {
   });
 }
 
-function reportSession(sessionID) {
+function reportSession(sessionID, sessionStartSource) {
   if (!sessionID) {
     return Promise.resolve();
   }
-  return request("pane.report_agent_session", { agent_session_id: sessionID });
+  const params = { agent_session_id: sessionID };
+  if (sessionStartSource) {
+    params.session_start_source = sessionStartSource;
+  }
+  return request("pane.report_agent_session", params);
 }
 
 function reportState(state, sessionID) {
@@ -144,15 +148,29 @@ export const HerdrAgentStatePlugin = async () => {
       const sessionID = sessionIDFromProperties(properties);
 
       const info = properties.info;
-      if (info?.id && info.parentID) {
+      // A self-parenting entry would make the ancestor walk below spin, so
+      // refuse to register it as a child at all.
+      if (info?.id && info.parentID && info.id !== info.parentID) {
         childSessions.set(info.id, info.parentID);
       }
       if (sessionID && childSessions.has(sessionID)) {
+        if (type === "session.deleted") {
+          // Prune the entry so the map cannot grow for the plugin's lifetime.
+          childSessions.delete(sessionID);
+          return;
+        }
         const state = CHILD_EVENT_STATES.get(type);
         if (state) {
           let rootSessionID = sessionID;
+          // Longer cycles can only come from malformed event data; the visited
+          // set guarantees termination with a best-effort root id.
+          const visited = new Set([rootSessionID]);
           while (childSessions.has(rootSessionID)) {
             rootSessionID = childSessions.get(rootSessionID);
+            if (visited.has(rootSessionID)) {
+              break;
+            }
+            visited.add(rootSessionID);
           }
           await reportState(state, rootSessionID);
         }
@@ -161,9 +179,14 @@ export const HerdrAgentStatePlugin = async () => {
 
       switch (type) {
         case "session.created":
-          // Creation is server-global, so an attached client may own it. The
-          // pane adopts its root session through chat.message/status reports.
+          // Creation is server-global, so an attached client may own it; but
+          // unlike opencode, kilo ships no TUI plugin that would adopt the
+          // root session later, so report a new root session here and let the
+          // session.updated guard below filter cross-talk afterwards.
           reportedRootSessionID = sessionID;
+          if (sessionID && !childSessions.has(sessionID)) {
+            await reportSession(sessionID, "startup");
+          }
           break;
         case "session.updated":
           if (sessionID && sessionID !== reportedRootSessionID) {
@@ -196,6 +219,9 @@ export const HerdrAgentStatePlugin = async () => {
           await reportState("idle", sessionID);
           break;
         case "session.deleted":
+          if (sessionID) {
+            childSessions.delete(sessionID);
+          }
           break;
         default:
           break;

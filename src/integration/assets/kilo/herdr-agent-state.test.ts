@@ -169,6 +169,85 @@ test("reports child prompts against the root session", async () => {
   ]);
 });
 
+test("session.created adopts a new root session", async () => {
+  const plugin = await loadPlugin();
+
+  await plugin.event({
+    event: { type: "session.created", properties: { sessionID: "root-session" } },
+  });
+
+  expect(requests.map(requestMethod)).toEqual(["pane.report_agent_session"]);
+  expect(requests.map(requestSessionID)).toEqual(["root-session"]);
+  expect(requestStartSource(requests[0])).toBe("startup");
+});
+
+test("session.created skips child sessions", async () => {
+  const plugin = await loadPlugin();
+
+  await plugin.event({
+    event: {
+      type: "session.created",
+      properties: {
+        sessionID: "child-session",
+        info: { id: "child-session", parentID: "root-session" },
+      },
+    },
+  });
+
+  expect(requests).toEqual([]);
+});
+
+test("session.deleted prunes the child entry", async () => {
+  const plugin = await loadPlugin();
+
+  await plugin.event({
+    event: {
+      type: "session.created",
+      properties: {
+        sessionID: "child-session",
+        info: { id: "child-session", parentID: "root-session" },
+      },
+    },
+  });
+  await plugin.event({
+    event: { type: "session.deleted", properties: { sessionID: "child-session" } },
+  });
+  await plugin.event({
+    event: { type: "permission.asked", properties: { sessionID: "child-session" } },
+  });
+
+  // The pruned id is no longer treated as a child, so the prompt is reported
+  // as a regular blocked state carrying the session id.
+  expect(requests.map(requestState)).toEqual(["blocked"]);
+  expect(requests.map(requestSessionID)).toEqual(["child-session"]);
+});
+
+test("self-parenting info cannot hang the ancestor walk", async () => {
+  const plugin = await loadPlugin();
+
+  await plugin.event({
+    event: {
+      type: "session.created",
+      properties: {
+        sessionID: "loop-session",
+        info: { id: "loop-session", parentID: "loop-session" },
+      },
+    },
+  });
+  await plugin.event({
+    event: { type: "permission.asked", properties: { sessionID: "loop-session" } },
+  });
+
+  // The self-parent id is never registered as a child, so creation adopts
+  // it as a root session and the prompt terminates instead of hanging.
+  expect(requests.map(requestMethod)).toEqual([
+    "pane.report_agent_session",
+    "pane.report_agent",
+  ]);
+  expect(requests.map(requestState)).toEqual([undefined, "blocked"]);
+  expect(requests.map(requestSessionID)).toEqual(["loop-session", "loop-session"]);
+});
+
 function requestMethod(request: unknown): unknown {
   return isRecord(request) ? request.method : undefined;
 }
@@ -183,6 +262,10 @@ function requestSeq(request: unknown): unknown {
 
 function requestSessionID(request: unknown): unknown {
   return requestParam(request, "agent_session_id");
+}
+
+function requestStartSource(request: unknown): unknown {
+  return requestParam(request, "session_start_source");
 }
 
 function requestParam(request: unknown, name: string): unknown {
