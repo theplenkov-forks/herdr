@@ -169,16 +169,19 @@ test("reports child prompts against the root session", async () => {
   ]);
 });
 
-test("session.created adopts a new root session", async () => {
+test("session.created records the root without reporting it", async () => {
   const plugin = await loadPlugin();
 
   await plugin.event({
     event: { type: "session.created", properties: { sessionID: "root-session" } },
   });
+  // Creation is server-global: the pane must not adopt it here. The matching
+  // session.updated below is filtered by the cross-talk guard.
+  await plugin.event({
+    event: { type: "session.updated", properties: { sessionID: "root-session" } },
+  });
 
-  expect(requests.map(requestMethod)).toEqual(["pane.report_agent_session"]);
-  expect(requests.map(requestSessionID)).toEqual(["root-session"]);
-  expect(requestStartSource(requests[0])).toBe("startup");
+  expect(requests).toEqual([]);
 });
 
 test("session.created skips child sessions", async () => {
@@ -238,14 +241,79 @@ test("self-parenting info cannot hang the ancestor walk", async () => {
     event: { type: "permission.asked", properties: { sessionID: "loop-session" } },
   });
 
-  // The self-parent id is never registered as a child, so creation adopts
-  // it as a root session and the prompt terminates instead of hanging.
-  expect(requests.map(requestMethod)).toEqual([
-    "pane.report_agent_session",
-    "pane.report_agent",
-  ]);
-  expect(requests.map(requestState)).toEqual([undefined, "blocked"]);
-  expect(requests.map(requestSessionID)).toEqual(["loop-session", "loop-session"]);
+  // The self-parent id is never registered as a child, so creation only
+  // records it and the prompt terminates instead of hanging.
+  expect(requests.map(requestMethod)).toEqual(["pane.report_agent"]);
+  expect(requests.map(requestState)).toEqual(["blocked"]);
+  expect(requests.map(requestSessionID)).toEqual(["loop-session"]);
+});
+
+test("repeated session.updated for the same id reports once", async () => {
+  const plugin = await loadPlugin();
+
+  await plugin.event({
+    event: { type: "session.updated", properties: { sessionID: "other-session" } },
+  });
+  await plugin.event({
+    event: { type: "session.updated", properties: { sessionID: "other-session" } },
+  });
+
+  expect(requests.map(requestMethod)).toEqual(["pane.report_agent_session"]);
+  expect(requests.map(requestSessionID)).toEqual(["other-session"]);
+});
+
+test("repeated unknown statuses report the session once", async () => {
+  const plugin = await loadPlugin();
+
+  await plugin.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "root-session", status: "custom-future-state" },
+    },
+  });
+  await plugin.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "root-session", status: "custom-future-state" },
+    },
+  });
+
+  expect(requests.map(requestMethod)).toEqual(["pane.report_agent_session"]);
+  expect(requests.map(requestSessionID)).toEqual(["root-session"]);
+});
+
+test("session.deleted prunes the whole subtree", async () => {
+  const plugin = await loadPlugin();
+
+  await plugin.event({
+    event: {
+      type: "session.created",
+      properties: {
+        sessionID: "child-session",
+        info: { id: "child-session", parentID: "root-session" },
+      },
+    },
+  });
+  await plugin.event({
+    event: {
+      type: "session.created",
+      properties: {
+        sessionID: "grandchild-session",
+        info: { id: "grandchild-session", parentID: "child-session" },
+      },
+    },
+  });
+  await plugin.event({
+    event: { type: "session.deleted", properties: { sessionID: "child-session" } },
+  });
+  await plugin.event({
+    event: { type: "permission.asked", properties: { sessionID: "grandchild-session" } },
+  });
+
+  // The grandchild no longer resolves to the deleted subtree, so the prompt
+  // is reported as a regular blocked state carrying its own session id.
+  expect(requests.map(requestState)).toEqual(["blocked"]);
+  expect(requests.map(requestSessionID)).toEqual(["grandchild-session"]);
 });
 
 function requestMethod(request: unknown): unknown {
@@ -262,10 +330,6 @@ function requestSeq(request: unknown): unknown {
 
 function requestSessionID(request: unknown): unknown {
   return requestParam(request, "agent_session_id");
-}
-
-function requestStartSource(request: unknown): unknown {
-  return requestParam(request, "session_start_source");
 }
 
 function requestParam(request: unknown, name: string): unknown {

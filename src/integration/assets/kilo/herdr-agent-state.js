@@ -106,11 +106,31 @@ function reportSession(sessionID, sessionStartSource) {
   if (!sessionID) {
     return Promise.resolve();
   }
+  reportedRootSessionID = sessionID;
   const params = { agent_session_id: sessionID };
   if (sessionStartSource) {
     params.session_start_source = sessionStartSource;
   }
   return request("pane.report_agent_session", params);
+}
+
+function pruneSessionSubtree(sessionID) {
+  // Collect the deleted id and every descendant before removing anything, so
+  // grandchildren are still reachable through their (doomed) parents.
+  const doomed = new Set([sessionID]);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const [child, parent] of childSessions) {
+      if (!doomed.has(child) && doomed.has(parent)) {
+        doomed.add(child);
+        grew = true;
+      }
+    }
+  }
+  for (const id of doomed) {
+    childSessions.delete(id);
+  }
 }
 
 function reportState(state, sessionID) {
@@ -155,8 +175,10 @@ export const HerdrAgentStatePlugin = async () => {
       }
       if (sessionID && childSessions.has(sessionID)) {
         if (type === "session.deleted") {
-          // Prune the entry so the map cannot grow for the plugin's lifetime.
-          childSessions.delete(sessionID);
+          // Prune the entry and its whole subtree so the map cannot grow for
+          // the plugin's lifetime and later child events cannot resolve to a
+          // deleted root.
+          pruneSessionSubtree(sessionID);
           return;
         }
         const state = CHILD_EVENT_STATES.get(type);
@@ -179,14 +201,11 @@ export const HerdrAgentStatePlugin = async () => {
 
       switch (type) {
         case "session.created":
-          // Creation is server-global, so an attached client may own it; but
-          // unlike opencode, kilo ships no TUI plugin that would adopt the
-          // root session later, so report a new root session here and let the
-          // session.updated guard below filter cross-talk afterwards.
+          // Creation is server-global, so an attached client may own it: only
+          // record the id for the session.updated guard below, never adopt it
+          // here. The pane adopts its root session through chat.message and
+          // session.status reports, mirroring the opencode plugin.
           reportedRootSessionID = sessionID;
-          if (sessionID && !childSessions.has(sessionID)) {
-            await reportSession(sessionID, "startup");
-          }
           break;
         case "session.updated":
           if (sessionID && sessionID !== reportedRootSessionID) {
@@ -197,7 +216,7 @@ export const HerdrAgentStatePlugin = async () => {
           const state = stateFromSessionStatus(properties.status);
           if (state) {
             await reportState(state, sessionID);
-          } else {
+          } else if (sessionID && sessionID !== reportedRootSessionID) {
             await reportSession(sessionID);
           }
           break;
